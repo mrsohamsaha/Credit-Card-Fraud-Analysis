@@ -1,0 +1,436 @@
+---
+title: "Credit Card Fraud Analysis"
+author: "Soham Saha (sohams2@illinois.edu)"
+date: "May 14th, 2020"
+output:
+  html_document: 
+    theme: default
+    toc: yes
+---
+
+```{r, setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align = "center", warning = FALSE, message = FALSE, cache = TRUE)
+```
+
+```{r, load-packages, include = FALSE}
+# load packages
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(gbm)
+library(ROSE)
+library(pROC)
+library("purrr")
+library(caret)
+library(RColorBrewer)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+```
+
+***
+
+# Abstract
+
+It is important for credit card companies to catch fraudulent credit card transactions so that their customers and the company themselves do not lose out on money. This analysis trained and tuned logistic regression, decision tree, random forest, and boosted tree models to determine which model is better at distinguishing between fraudulent and genuine transactions. The challenge was that this dataset was heavily imbalanced favoring genuine cases. To combat this imbalance, undersampling was done to create the training set. From using a baseline version of each model, the random forest and boosted tree models had the best 5-fold cross-validation AUC score with 0.9831284	and 0.9841612 respectively. Further parameter tuning was done on the random forest and boosted tree models with 5-fold cross-validation resulting in an improved AUC score of 0.9838997 and 0.9845678 respectively. When these models were evaluated on the test set, the boosted model performed the best with an accuracy of 0.9689091, a sensitivity of 0.9215686, and a specificity of 0.9689940. The boosted model achieved the goal of being able to have a high detection rate of fraud transactions missing less than 8% of fraud transactions in the test set. It is favorable for a model to detect more fraud cases in the expense of misclassifying more genuine cases.
+
+***
+
+# Introduction
+
+In this analysis, we will be investigating various models to determine which one would be best in detecting whether a credit card transaction is fraudulent or genuine. Credit card fraud occurs when an unauthorized person uses someone else's credit card to make an unwanted purchase. This can happen from either a person loosing or getting their credit card stolen, or a fraudster stealing the account number, pin, and security code of a credit card. 
+
+Recently, financial institutions across Europe have seen a rise in credit card fraud and have been struggling to catch these cases. The goal of this analysis is to build a model that can accurately detect fraudulent credit card transactions. This analysis is important because the victims of credit card fraud are financially hurt and financial institutions lose revenue as well. Having a high-performing model run in the background of a credit card transaction systems can stop fraud before the damage has been dealt.   
+
+When taking a quick glance at the dataset, we can clearly see there is a class imbalance as 492 frauds occurred out of 284,807 transactions. Fraud cases only account for 0.172% of all transactions. Therefore, the challenge of the analysis will be detecting as many of these rare fraud transactions. 
+
+```{r, include=FALSE}
+# load dataset
+data <- readr::read_csv("creditcard.csv")
+
+# make response a factor with names instead of numbers
+data$Class <- factor(ifelse(data$Class == 0, "genuine", "fraud"))
+```
+```{r, echo=FALSE}
+# check proportion of fraud vs genuine observations
+kable(data.frame(
+  Fraud = c(summary(data$Class)["fraud"]),
+  Genuine = c(summary(data$Class)["genuine"])
+), row.names = FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+colors <- brewer.pal(5, "Set2")
+barplot(summary(data$Class),
+  main = "Transaction Distribution",
+  xlab = "Number of Transactions", ylab = "Count", col = colors
+)
+```
+
+***
+
+# Methods
+
+## Data
+
+The source of the data comes from credit card transactions made by European cardholders over a two day span in September 2013. There are 30 input features in the dataset which all are numerical. Features labeled `V1, V2 … V28` are derived from the result of a PCA transformation. There are two features that have not been transformed by PCA, `Time` and `Amount`. The feature `Time` represents the seconds elapsed from the current transaction and the first transaction in the dataset. The feature `Amount` is the monetary amount of a transaction. The response variable is a categorical feature called `Class` which is either labeled as *genuine* or *fraud*.  
+
+```{r}
+kable(head(data)) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+In regards to addressing the class imbalance in the dataset, we can either leave the dataset as-is or re-sample the data. Re-sampling could either involve undersampling, oversampling, or a hybrid of both. For this analysis, we will create one training set from the original data and another training set from undersampling. To undersample the data, we keep keep all observations of the minority class (*fraud*) and take a subsample of the majority class (*genuine*) so that there is approximately a 50-50 split between the classes. However, we must first split the data into a train-test set before performing any undersampling. This is because the test set should reflect the true nature of the data and should not be processed at all.
+
+```{r echo=TRUE}
+# create 20-80 test and train splits
+set.seed(42)
+trn_idx <- sample(nrow(data), size = 0.8 * nrow(data))
+trn <- data[trn_idx, ]
+tst <- data[-trn_idx, ]
+```
+```{r, echo=FALSE}
+# check if fraud vs genuine proportion is similar in test and train splits
+trn_summary <- summary(trn$Class)
+trn_fraud_prop <- trn_summary[1] / sum(trn_summary)
+tst_summary <- summary(tst$Class)
+tst_fraud_prop <- tst_summary[1] / sum(tst_summary)
+
+# create table for displaying class proportions of train and test sets
+kable(data.frame(
+  Dataset = c("Train", "Test"),
+  Fraud_Percentage = c(trn_fraud_prop, tst_fraud_prop)
+)) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+```{r, echo=TRUE}
+# undersample training data
+set.seed(42)
+trn_under <- ovun.sample(Class ~ ., data = trn, method = "under", p = 0.5)$data
+```
+```{r, echo=FALSE}
+kable(data.frame(
+  Fraud = c(summary(trn_under$Class)["fraud"]),
+  Genuine = c(summary(trn_under$Class)["genuine"])
+), row.names = FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+# check if class proportion is approximately 50-50
+barplot(summary(trn_under$Class),
+  main = "Transaction Distribution in sub-Sample",
+  xlab = "Number of Transactions", ylab = "Count", col = colors
+)
+```
+
+Due to the size of the original training set, we will take a subsample in order to speed-up training and evaluation time. The subsample will approximately maintain the class imbalance from the full training set. 
+
+```{r echo=TRUE}
+# subsample training data
+set.seed(42)
+sub_idx = createDataPartition(trn$Class, p = 0.75, list = FALSE)
+trn_sub = trn[-sub_idx,]
+```
+```{r, echo=FALSE}
+# create table for displaying class proportions of subsampled training set
+kable(data.frame(
+  Dataset = c("Train Subsample"),
+  Fraud_Percentage = c(summary(trn_sub$Class)[1]/sum(summary(trn_sub$Class)))
+), row.names = FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+## Modeling
+
+We will be training four types of classifiers on the two training sets and determine which ones are the most effective in classifying fraud transactions. The four models are logistic regression, decision tree, random forest, and boosted tree. AUC (Area Under Curve for the Receiver Operator Characteristic) will be the metric in evaluating the performance for each model. Accuracy is not a good metric for evaluation because the no information rate of the original dataset is very high (over 0.99). It is more important to see how well a  model can distinguish between the two classes, which is what AUC measures.
+
+5-fold cross-validation will be used on each model with each training set to assess which one has the best AUC score.
+
+- **logistic regression**: All 30 features are used.
+- **decision tree**: We set the parameter `cp` to 0.1. 
+- **random forest**: We set the parameter `ntrees` to 500 and `mtry` to $\sqrt{p}.$ which is the recommended value for classification. In this case, $p$=30, so `mtry` rounds to 5. 
+- **boosted tree**: we set `n.trees` to 5000, `interaction.depth` to 4, and `shrinkage` to 0.01.
+
+The models and the corresponding training set that produced the best initial AUC scores will be tuned with 5-fold cross-validation again to optimize its performance. The tuned models will then be evaluated on the test set. 
+
+```{r}
+# 5-fold cross-validation tune control
+set.seed(42)
+cv_5 <- trainControl(method = "cv", 
+                     number = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary
+                    )
+
+# helper function to train the four models and calculate the cross-validated AUC
+calc_cv_auc = function(trn_data) {
+  set.seed(42)
+  glm_mod <- train(Class ~ .,
+    data = trn_data,
+    method = "glm",
+    family = "binomial",
+    trControl = cv_5,
+    metric = "ROC"
+  )
+  
+  tree_grid <- expand.grid(
+    cp = 0.1
+  )
+  
+  set.seed(42)
+  tree_mod <- train(Class ~ .,
+    data = trn_data,
+    method = "rpart",
+    trControl = cv_5,
+    metric = "ROC",
+    tuneGrid = tree_grid
+  )
+  
+  rf_grid <- expand.grid(
+    mtry = 6
+  )
+  
+  set.seed(42)
+  rf_mod <- train(Class ~ .,
+    data = trn_data,
+    method = "rf",
+    trControl = cv_5,
+    metric = "ROC",
+    tuneGrid = rf_grid,
+    verbose = FALSE
+  )
+  
+  gbm_grid <- expand.grid(
+    interaction.depth = 4,
+    n.trees = 500,
+    shrinkage = c(0.01),
+    n.minobsinnode = 10
+  )
+  
+  set.seed(42)
+  gbm_mod <- train(Class ~ .,
+    data = trn_data,
+    method = "gbm",
+    trControl = cv_5,
+    metric = "ROC",
+    tuneGrid = gbm_grid,
+    verbose = FALSE
+  )
+  
+  c(glm_mod$results$ROC, tree_mod$results$ROC, rf_mod$results$ROC, gbm_mod$results$ROC)
+}
+
+```
+```{r, include = FALSE}
+# calculate the 5-fold cross-validation AUC for the four models with both training sets
+auc_trn_under <- calc_cv_auc(trn_under)
+auc_trn_sub <- calc_cv_auc(trn_sub)
+```
+
+***
+
+# Results
+
+## Model Selection
+
+Looking at the initial results below, we can see that the models trained with the undersampled training set had a higher AUC than the models trained with the subsampled training set. Furthermore, the ensemble methods out-performed both logistic regression and the decision tree in both training sets. Since random forest and boosted trees have a very close AUC with the undersampled training set, we will tune both those models with that training set. 
+
+```{r, echo=FALSE}
+trn_auc_df <- data.frame(Sampling=rep(c("Subsample", "Undersample"), each=4),
+                Model=rep(c("Logistic Regression", "Decision Tree", "Random Forest", "Boosting"),2),
+                AUC=c(auc_trn_sub, auc_trn_under))
+AUC_round = round(c(auc_trn_sub, auc_trn_under), digits = 3)
+ggplot(data=trn_auc_df, aes(x=Model, y=AUC, fill=Sampling)) +
+geom_bar(stat="identity", position=position_dodge())+
+geom_text(aes(label=AUC_round), vjust=1.6, color="white",
+        position = position_dodge(0.9), size=3.5)+
+scale_fill_brewer(palette="Set1")+
+theme_minimal()
+```
+
+Again, we are going to perform 5-fold cross-validation to determine the optimal parameters for each model. 
+
+```{r, include = FALSE}
+get_best_result <- function(caret_fit) {
+  best <- which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result <- caret_fit$results[best, ]
+  rownames(best_result) <- NULL
+  best_result
+}
+```
+
+
+For the random forest model, we will make a tuning grid of `mtry` values covering all possible values (there are 30 predictors).
+
+```{r echo=TRUE, results="hide"}
+rf_grid <- expand.grid(mtry = 1:30)
+
+set.seed(42)
+rf_tune <- train(Class ~ .,
+  data = trn_under,
+  method = "rf",
+  trControl = cv_5,
+  verbose = FALSE,
+  tuneGrid = rf_grid,
+  metric = "ROC",
+  importance = T
+)
+```
+
+Based on these results below, the random forest model that produced the highest AUC was the model with an `mtry` of **14**. There was a slight increase in **AUC** from **0.9831284** to **0.9838997**.
+
+```{r, echo=FALSE }
+plot(rf_tune)
+```
+
+
+```{r}
+kable(get_best_result(rf_tune), caption = "Tuned Random Forest Parameters & Metrics") %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+For the boosted trees model, we will make a tuning grid to tune `interaction.depth`, `n.trees`, `shrinkage`, and `n.minobsinnode`.
+
+```{r echo=TRUE, results="hide"}
+gbm_grid =  expand.grid(interaction.depth = 1:5,
+                        n.trees = (1:6) * 500,
+                        shrinkage = c(0.001, 0.01, 0.1),
+                        n.minobsinnode = 10)
+
+set.seed(42)
+gbm_tune <- train(Class ~ .,
+  data = trn_under,
+  method = "gbm",
+  trControl = cv_5,
+  verbose = FALSE,
+  tuneGrid = gbm_grid,
+  metric = "ROC"
+)
+```
+
+Based on these results below, the boosted trees model that produced the highest AUC was the model with an `interaction.depth` of 5, `n.trees` of 500, `shrinkage` of 0.01, and `n.minobsinnode`of 10. There was a slight increase in **AUC** from **0.9841612** to **0.9845678**.
+
+```{r, echo=FALSE }
+plot(gbm_tune)
+```
+```{r, echo=FALSE}
+kable(get_best_result(gbm_tune), caption = "Tuned Boosted Tree Parameters & Metrics") %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+Again, the difference between the random forest model and the boosted trees model is very slight. Therefore, both tuned models will be evaluated on the test data we created at the very beginning of this analysis. It is important to note again that the test set is imbalanced unlike the undersampled train set we used to train the models. 
+
+```{r, echo=FALSE}
+kable(data.frame(
+  Model = c("Tuned Random Forest", "Tuned Boosting"),
+  AUC = c(get_best_result(rf_tune)$ROC, get_best_result(gbm_tune)$ROC)
+)) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+## Test Evaluation
+
+After evaluating both the tuned random forest and tuned boosted tree model on the test data, the results are shown below. 
+
+These are the confusion matrices for the two models.
+
+```{r}
+tst_pred_rf <- predict(rf_tune, tst, type = "raw")
+rf_confmat <- confusionMatrix(data = tst_pred_rf, reference = tst$Class)
+
+tst_pred_gbm <- predict(gbm_tune, tst, type = "raw")
+gbm_confmat <- confusionMatrix(data = tst_pred_gbm, reference = tst$Class)
+
+kable(list(rf_confmat$table, gbm_confmat$table), caption = "Confusion Matrices") %>%
+  kable_styling(bootstrap_options = "striped", full_width = F) %>%
+  footnote(general = "Left Matrix: Random Forest | Right Matrix: Boosted Tree.")
+```
+
+The results below are for the accuracy, sensitivity and specificity for each model.
+
+```{r, echo=FALSE}
+kable(data.frame(
+  Model = c("Tuned Random Forest", "Tuned Boosting"),
+  Accuracy = c(rf_confmat$overall[1], gbm_confmat$overall[1]),
+  Sensitivity = c(rf_confmat$byClass[1], gbm_confmat$byClass[1]),
+  Specificity = c(rf_confmat$byClass[2], gbm_confmat$byClass[2])
+)) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+We should also take note of the `Amount` of the fraud transactions that were misclassified. Below is a summary statistics table a histogram plot of the `Amount` in the test set.
+
+```{r echo=FALSE}
+tst_amount_summary <- summary(tst$Amount)
+
+kable(data.frame(
+  Min = c(tst_amount_summary['Min.']),
+  Q1 = c(tst_amount_summary['1st Qu.']),
+  Median = c(tst_amount_summary['Median']),
+  Mean = c(tst_amount_summary['Mean']),
+  Q3 = c(tst_amount_summary['3rd Qu.']),
+  Max = c(tst_amount_summary['Max.'])
+), row.names = FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+
+ggplot(data.frame(Amount = tst$Amount), aes(x=Amount)) + 
+  geom_histogram(binwidth=250, color="darkblue", fill="lightblue") + 
+  labs(title = "Test Set Amount Histogram")
+```
+
+The two tables below are the `Amount` of fraudulent transactions that were misclassified as genuine. 
+
+```{r echo = FALSE}
+fn_amount_rf <- tst[intersect(which(tst_pred_rf == "genuine"), which(tst$Class == "fraud")), "Amount"]
+fn_amount_gbm <- tst[intersect(which(tst_pred_gbm == "genuine"), which(tst$Class == "fraud")), "Amount"]
+kable(list(fn_amount_rf, fn_amount_gbm), caption = "RF VS GBM Misclassified Fraud") %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "center") %>%
+  footnote(general = "Left Table: Random Forest | Right Table: Boosted Tree.")
+```
+***
+
+# Discussion
+
+From the results above, random forest and boosted tree again performed similarly when evaluated on the test data. Now we will analyze in-depth what each of the results signify.
+
+## Confusion Matrix
+In terms of our dataset, this is what each quadrant of the confusion matrix means.
+
+- **True Positives (Upper Left)**: The number of test observations that were fraud transactions and correctly classified by the model.
+
+- **False Positives (Upper Right)**: The number of test observations that were genuine transactions but incorrectly classified by the model. 
+
+- **False Negatives (Lower Left)**: The number of test observations that were fraud transactions but incorrectly classified by the model.
+
+- **True Negatives (Lower Right)**: The number of test observations that were genuine and correctly classified by the model.
+
+To reiterate, the goal of this analysis is to create a model that can correctly detect fraudulent credit card transactions. That means we would want our model to maximize the number of true positives. In that case, the boosted tree model did better by one observation. At the same time, the boosted tree model had 283 fewer false negatives that the random forest model.
+
+The ramifications between the two types of errors (false positives and false negatives) are very different. False positives represent the case where a cardholder is making a genuine purchase but their card is blocked because the model predicted the transaction as fraud. While this would be frustrating for customer of the credit card, this is the model's way of being cautionary against fraud. False negatives represent when a fraudster got away with committing credit card fraud, which is the worst-case scenario. 
+
+It is interesting to see that both the random forest and boosted model misclassified the same 8 fraud observations (random forest misclassified 1 more fraud observation). Only 4 of those fraud observations misclassified were above the 3rd quantile (76.4025) and mean (87.2194) `Amount` in the test set. This highlights how both models only allowed a few fraud cases to go undetected, which is a good sign. 
+
+## Accuracy 
+
+As stated before, accuracy is not the key metric we want to use to determine which model is better at detecting fraud transactions. Nonetheless, it does give us insight to the overall predictive ability of the models. Both models performed under the no-information rate (0.99828). That is the challenge with an imbalanced dataset: to be able to increase the true positive rate while performing above the no-information rate. The reason the random forest and boosted tree models did not surpass the no-information rate was because they were trained on an underspampled dataset which is prone to underfitting. Undersampling the majority class (genuine transactions) leads to information loss on the majority class. 
+
+## Sensitivity & Specificity 
+
+AUC was the metric we used to select and tune our final model. Sensitivity and specificity are the axes that create the ROC curve. In the context of this dataset, sensitivity is the rate in which fraud transactions are correctly classified. Specificity is the rate in which genuine transactions are correctly classified. The boosted tree model achieved a better specificity and sensitivity over the random forest model. That means that the boosted tree model is better at distinguishing between fraudulent and genuine transactions.
+
+## Conclusion
+
+From all the metrics and factors discussed above, it is clear that the boosted model was the best model for detecting fraud transactions. However, there is still room for improvement. In the test set, the boosted model had a precision of 0.0506. In a real world context, that means that about 5% of the time when our model classifies a transaction as fraud, is it actually fraud. In a real world system, this would be problematic for credit card companies as they would need implement additional measures to determine if the transaction was truly fraud. On the other hand, it is better to have a model more willing to classify fraud cases in order to identify as many as possible. The boosted tree model had a recall of 0.9216, meaning as only about 8% of fraud transactions were misclassified. 
+
+Some future steps to improve the model would be looking into training models by oversampling the original dataset or using a hybrid of oversampling and undersampling. Another area of improvement would be determining if `Time` is a variable of importance. It could be investigated whether fraud occurs more often at a specific time of the day or not.
+
+***
+
+# Appendix
+
+Data Dictionary:
+Due to the majority of features being derived from a PCA transformation and the original features not being disclosed for confidentiality reasons, there only a few specific features to report for a data dictionary. 
+
+- **V1-V28**: These features are floating numbers that were the result of a PCA transformation
+- **Time**: This feature is an integer that represents the seconds elapsed from the current transaction and the first transaction in the dataset
+- **Amount**: This feature is a floating number that represents the purchase amount from the transaction in an unspecified currency. 
+- **Class**: This feature is a categorical variable that takes two values, `fraud` or `genuine`. 
+
+***
